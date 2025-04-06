@@ -16,6 +16,13 @@ import { X, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { cn } from './utils/cn';
 
+// Rate limiting configuration
+const RATE_LIMIT = {
+  MAX_REQUESTS: 3,
+  WINDOW_MS: 1000, // 1 second
+  COOLDOWN_MS: 2000 // 2 seconds cooldown after hitting limit
+};
+
 function App() {
   const { isDark } = useThemeStore();
   const { messages, userType, language, isInitialized, addMessage, setUserType, loadMessages, clearMessages, setInitialized } = useChatStore();
@@ -28,6 +35,12 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [retryCount, setRetryCount] = useState(0);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // Rate limiting state
+  const requestCountRef = useRef<number>(0);
+  const lastRequestTimeRef = useRef<number>(Date.now());
+  const cooldownTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -68,8 +81,117 @@ function App() {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      if (cooldownTimeoutRef.current) {
+        clearTimeout(cooldownTimeoutRef.current);
+      }
     };
   }, []);
+
+  const checkRateLimit = (): boolean => {
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTimeRef.current;
+
+    // Reset counter if window has passed
+    if (timeSinceLastRequest > RATE_LIMIT.WINDOW_MS) {
+      requestCountRef.current = 0;
+      lastRequestTimeRef.current = now;
+    }
+
+    // Check if we're in cooldown
+    if (cooldownTimeoutRef.current) {
+      return false;
+    }
+
+    // Increment counter and check limit
+    requestCountRef.current++;
+    if (requestCountRef.current > RATE_LIMIT.MAX_REQUESTS) {
+      cooldownTimeoutRef.current = setTimeout(() => {
+        cooldownTimeoutRef.current = null;
+        requestCountRef.current = 0;
+      }, RATE_LIMIT.COOLDOWN_MS);
+      return false;
+    }
+
+    return true;
+  };
+
+  const makeApiRequest = async (message: string, retryAttempt = 0): Promise<Response> => {
+    if (!checkRateLimit()) {
+      await new Promise(resolve => setTimeout(resolve, RATE_LIMIT.COOLDOWN_MS));
+      return makeApiRequest(message, retryAttempt);
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const timeoutDuration = 15000; // 15 seconds timeout
+    const timeoutPromise = new Promise<Response>((_, reject) => {
+      timeoutRef.current = setTimeout(() => {
+        controller.abort();
+        reject(new Error('Request timeout'));
+      }, timeoutDuration);
+    });
+
+    try {
+      const fetchPromise = fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
+          'HTTP-Referer': window.location.origin,
+          'X-Title': 'Sakha Chatbot'
+        },
+        body: JSON.stringify({
+          model: 'deepseek/deepseek-r1:free',
+          messages: [
+            {
+              role: 'system',
+              content: getSystemPrompt()
+            },
+            ...messages.slice(-5).map(msg => ({
+              role: msg.isBot ? 'assistant' : 'user',
+              content: msg.content
+            })),
+            {
+              role: 'user',
+              content: message
+            }
+          ],
+          temperature: 0.5,
+          max_tokens: 1000,
+          top_p: 0.9,
+          presence_penalty: 0.6,
+          frequency_penalty: 0.5
+        })
+      });
+
+      const response = await Promise.race([fetchPromise, timeoutPromise]);
+      
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status}`);
+      }
+
+      return response;
+    } catch (error) {
+      if (error.name === 'AbortError' || error.message === 'Request timeout') {
+        if (retryAttempt < 2) {
+          // Exponential backoff
+          const backoffTime = Math.min(1000 * Math.pow(2, retryAttempt), 5000);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+          return makeApiRequest(message, retryAttempt + 1);
+        }
+      }
+      throw error;
+    } finally {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+    }
+  };
 
   const handleUserTypeSelection = async (type: 'sakha' | 'sakhi') => {
     if (!user) {
@@ -142,63 +264,24 @@ Remember: Your goal is to make ancient wisdom accessible and practical for moder
       abortControllerRef.current.abort();
     }
 
-    abortControllerRef.current = new AbortController();
-
     await addMessage(message, false);
     setIsTyping(true);
+    setRetryCount(0);
 
     try {
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        signal: abortControllerRef.current.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
-          'HTTP-Referer': window.location.origin,
-          'X-Title': 'Sakha Chatbot'
-        },
-        body: JSON.stringify({
-          model: 'deepseek/deepseek-r1:free',
-          messages: [
-            {
-              role: 'system',
-              content: getSystemPrompt()
-            },
-            ...messages.slice(-5).map(msg => ({
-              role: msg.isBot ? 'assistant' : 'user',
-              content: msg.content
-            })),
-            {
-              role: 'user',
-              content: message
-            }
-          ],
-          temperature: 0.7,
-          max_tokens: 1000,
-          top_p: 0.9
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status}`);
-      }
-
+      const response = await makeApiRequest(message);
       const data = await response.json();
+      
       if (data.choices?.[0]?.message?.content) {
         await addMessage(data.choices[0].message.content, true);
-        setRetryCount(0);
       } else {
         throw new Error('Invalid API response format');
       }
     } catch (error) {
-      if (error.name === 'AbortError') {
-        return;
-      }
-
       console.error('Chat API Error:', error);
       
       setRetryCount(prev => prev + 1);
-      if (retryCount >= 3) {
+      if (retryCount >= 2) {
         toast.error('We are experiencing technical difficulties. Please try again later. 🙏');
       } else {
         toast.error('Unable to connect. Please try again. 🙏');
@@ -275,29 +358,28 @@ Remember: Your goal is to make ancient wisdom accessible and practical for moder
           </div>
 
           <div className="fixed bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-gray-50 via-gray-50 dark:from-gray-900 dark:via-gray-900">
-  <div className="mx-auto w-full max-w-4xl px-2">
-    <div className="flex items-center gap-2">
-      <div className="flex-grow">
-        <ChatInput onSend={handleSendMessage} />
-      </div>
-      <button
-        onClick={handleClearChat}
-        className={cn(
-          "flex items-center justify-center p-2 rounded-md transition-colors text-sm",
-          showClearConfirm
-            ? "bg-red-500 text-white hover:bg-red-600"
-            : "bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-700"
-        )}
-      >
-        <Trash2 className="w-4 h-4" />
-        <span className="ml-1 hidden sm:inline">
-          {showClearConfirm ? "Confirm?" : "Clear"}
-        </span>
-      </button>
-    </div>
-  </div>
-</div>
-
+            <div className="mx-auto w-full max-w-4xl px-2">
+              <div className="flex items-center gap-2">
+                <div className="flex-grow">
+                  <ChatInput onSend={handleSendMessage} />
+                </div>
+                <button
+                  onClick={handleClearChat}
+                  className={cn(
+                    "flex items-center justify-center p-2 rounded-md transition-colors text-sm",
+                    showClearConfirm
+                      ? "bg-red-500 text-white hover:bg-red-600"
+                      : "bg-gray-200 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-700"
+                  )}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span className="ml-1 hidden sm:inline">
+                    {showClearConfirm ? "Confirm?" : "Clear"}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
         </main>
 
         <AnimatePresence>
