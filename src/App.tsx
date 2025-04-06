@@ -174,7 +174,7 @@ Remember: Your goal is to make ancient wisdom accessible and practical for moder
             }
           ],
           temperature: 0.7,
-          max_tokens: 500,
+          max_tokens: 1000,
           top_p: 0.9
         })
       });
