@@ -26,9 +26,7 @@ export function Header({ onAuthClick, onSignOut }: HeaderProps) {
             <MessageCircle className="w-5 h-5 text-purple-600" />
             <h1 className="text-lg sm:text-xl font-bold text-gray-800 dark:text-white flex items-center gap-1">
               Sakha
-              <span className="text-xs sm:text-sm font-normal text-gray-500 dark:text-gray-300">
-                
-              </span>
+             
             </h1>
           </div>
 
