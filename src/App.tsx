@@ -16,11 +16,10 @@ import { X, Trash2 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { cn } from './utils/cn';
 
-// Rate limiting configuration
 const RATE_LIMIT = {
   MAX_REQUESTS: 3,
-  WINDOW_MS: 1000, // 1 second
-  COOLDOWN_MS: 2000 // 2 seconds cooldown after hitting limit
+  WINDOW_MS: 1000,
+  COOLDOWN_MS: 2000
 };
 
 function App() {
@@ -37,7 +36,6 @@ function App() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   
-  // Rate limiting state
   const requestCountRef = useRef<number>(0);
   const lastRequestTimeRef = useRef<number>(Date.now());
   const cooldownTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -72,7 +70,7 @@ function App() {
 
   useEffect(() => {
     if (!userType && user && messages.length === 0 && isInitialized) {
-      addMessage("Namaste! 🙏 I'm delighted to meet you! Would you like me to call you Sakha (brother) or Sakhi (sister)? This will help me guide you better on your spiritual journey. 💫", true);
+     addMessage("Namaste! 🙏 I'm delighted to meet you! Would you like me to call you Sakha (brother) or Sakhi (sister)? This will help me guide you better on your spiritual journey. 💫\n\nNote: You will have only 5 messages per day. This limit exists because it's a free service. We need to prevent spam and maintain the site. Thank you for your understanding. 🙏", true);
     }
   }, [user, messages.length, userType, isInitialized, addMessage]);
 
@@ -94,18 +92,15 @@ function App() {
     const now = Date.now();
     const timeSinceLastRequest = now - lastRequestTimeRef.current;
 
-    // Reset counter if window has passed
     if (timeSinceLastRequest > RATE_LIMIT.WINDOW_MS) {
       requestCountRef.current = 0;
       lastRequestTimeRef.current = now;
     }
 
-    // Check if we're in cooldown
     if (cooldownTimeoutRef.current) {
       return false;
     }
 
-    // Increment counter and check limit
     requestCountRef.current++;
     if (requestCountRef.current > RATE_LIMIT.MAX_REQUESTS) {
       cooldownTimeoutRef.current = setTimeout(() => {
@@ -127,7 +122,7 @@ function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    const timeoutDuration = 15000; // 15 seconds timeout
+    const timeoutDuration = 15000;
     const timeoutPromise = new Promise<Response>((_, reject) => {
       timeoutRef.current = setTimeout(() => {
         controller.abort();
@@ -135,51 +130,68 @@ function App() {
       }, timeoutDuration);
     });
 
-    try {
-      const fetchPromise = fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${import.meta.env.VITE_OPENROUTER_API_KEY}`,
-          'HTTP-Referer': window.location.origin,
-          'X-Title': 'Sakha Chatbot'
-        },
-        body: JSON.stringify({
-          model: 'deepseek/deepseek-r1:free',
-          messages: [
-            {
-              role: 'system',
-              content: getSystemPrompt()
-            },
-            ...messages.slice(-5).map(msg => ({
-              role: msg.isBot ? 'assistant' : 'user',
-              content: msg.content
-            })),
-            {
-              role: 'user',
-              content: message
-            }
-          ],
-          temperature: 0.5,
-          max_tokens: 1000,
-          top_p: 0.9,
-          presence_penalty: 0.6,
-          frequency_penalty: 0.5
-        })
-      });
+    const makeRequestWithKey = async () => {
+      try {
+        const fetchPromise = fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${useChatStore.getState().getCurrentApiKey()}`,
+            'HTTP-Referer': window.location.origin,
+            'X-Title': 'Sakha Chatbot'
+          },
+          body: JSON.stringify({
+            model: 'deepseek/deepseek-r1:free',
+            messages: [
+              {
+                role: 'system',
+                content: getSystemPrompt()
+              },
+              ...messages.slice(-5).map(msg => ({
+                role: msg.isBot ? 'assistant' : 'user',
+                content: msg.content
+              })),
+              {
+                role: 'user',
+                content: message
+              }
+            ],
+            temperature: 0.5,
+            max_tokens: 1000,
+            top_p: 0.9,
+            presence_penalty: 0.6,
+            frequency_penalty: 0.5
+          })
+        });
 
-      const response = await Promise.race([fetchPromise, timeoutPromise]);
-      
-      if (!response.ok) {
-        throw new Error(`API request failed: ${response.status}`);
+        const response = await Promise.race([fetchPromise, timeoutPromise]);
+        
+        if (!response.ok) {
+          if (response.status === 429) {
+            useChatStore.getState().rotateApiKey();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return makeRequestWithKey();
+          }
+          throw new Error(`API request failed: ${response.status}`);
+        }
+
+        return response;
+      } catch (error) {
+        if (error.message.includes('429')) {
+          useChatStore.getState().rotateApiKey();
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          return makeRequestWithKey();
+        }
+        throw error;
       }
+    };
 
-      return response;
+    try {
+      return await makeRequestWithKey();
     } catch (error) {
       if (error.name === 'AbortError' || error.message === 'Request timeout') {
         if (retryAttempt < 2) {
-          // Exponential backoff
           const backoffTime = Math.min(1000 * Math.pow(2, retryAttempt), 5000);
           await new Promise(resolve => setTimeout(resolve, backoffTime));
           return makeApiRequest(message, retryAttempt + 1);
@@ -245,6 +257,11 @@ Remember: Your goal is to make ancient wisdom accessible and practical for moder
   const handleSendMessage = async (message: string) => {
     if (!user) {
       setIsAuthModalOpen(true);
+      return;
+    }
+
+    if (!useChatStore.getState().checkDailyLimit()) {
+      toast.error('You have reached your daily limit of 5 messages. Please come back tomorrow to continue our spiritual journey! 🙏\n\nWe maintain these limits to ensure quality service while keeping it free for all seekers.');
       return;
     }
 
