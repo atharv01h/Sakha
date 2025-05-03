@@ -90,7 +90,7 @@ export const useChatStore = create(
           }
         }
 
-        return dailyMessageCount < 5;
+        return dailyMessageCount < 30;
       },
 
       resetDailyCount: () => {
